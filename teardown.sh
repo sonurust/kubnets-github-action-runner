@@ -11,29 +11,35 @@ export KUBECONFIG=${KUBECONFIG:-/etc/rancher/k3s/k3s.yaml}
 echo "🧹 Tearing down GitHub Actions Runner infrastructure..."
 echo ""
 
-# Uninstall runner scale set
-if helm list -n "$NAMESPACE" 2>/dev/null | grep -q "^grocery-runner"; then
-  echo "🗑️  Uninstalling runner scale set..."
-  helm uninstall grocery-runner -n "$NAMESPACE"
-  echo "✅ Runner scale set removed"
+# Uninstall all runner scale sets in the namespace
+RELEASES=$(helm list -n "$NAMESPACE" --short 2>/dev/null || true)
+if [ -n "$RELEASES" ]; then
+  for RELEASE in $RELEASES; do
+    echo "🗑️  Uninstalling $RELEASE..."
+    helm uninstall "$RELEASE" -n "$NAMESPACE" --wait --timeout 60s 2>/dev/null || true
+    echo "✅ $RELEASE removed"
+  done
 else
-  echo "⏭️  Runner scale set not found, skipping"
+  echo "⏭️  No Helm releases found, skipping"
 fi
 
-# Uninstall ARC controller
-if helm list -n "$NAMESPACE" 2>/dev/null | grep -q "^arc"; then
-  echo "🗑️  Uninstalling ARC controller..."
-  helm uninstall arc -n "$NAMESPACE"
-  echo "✅ ARC controller removed"
-else
-  echo "⏭️  ARC controller not found, skipping"
-fi
-
-# Delete namespace
+# Delete namespace (with timeout)
 if kubectl get ns "$NAMESPACE" &>/dev/null 2>/dev/null; then
   echo "🗑️  Deleting namespace $NAMESPACE..."
-  kubectl delete ns "$NAMESPACE"
+  kubectl delete ns "$NAMESPACE" --timeout=60s 2>/dev/null || {
+    echo "⚠️  Namespace stuck, force-removing finalizers..."
+    kubectl get ns "$NAMESPACE" -o json | jq '.spec.finalizers = []' | \
+      kubectl replace --raw "/api/v1/namespaces/$NAMESPACE/finalize" -f - > /dev/null 2>&1 || true
+    echo "✅ Namespace force-deleted"
+  }
   echo "✅ Namespace deleted"
+fi
+
+# Delete PersistentVolume (PVC is deleted with namespace)
+if kubectl get pv runner-cache-pv &>/dev/null 2>/dev/null; then
+  echo "🗑️  Deleting cache PersistentVolume..."
+  kubectl delete pv runner-cache-pv
+  echo "✅ PV removed (cache data at /data/runner-cache is preserved)"
 fi
 
 # Optionally remove cert-manager
@@ -47,3 +53,4 @@ fi
 
 echo ""
 echo "🏁 Teardown complete!"
+echo "Note: Cache data at /data/runner-cache is preserved. Run 'sudo rm -rf /data/runner-cache' to delete it."
