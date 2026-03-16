@@ -1,0 +1,229 @@
+##############################################################################
+# Build Driver App (Android) — with Shared Dependency Cache
+#
+# 1. setup_env  → downloads Flutter, Android SDK, pub deps (only if missing)
+# 2. build_apk  → runs AFTER setup, cache is warm, no downloads
+# 3. build_aab  → runs AFTER setup, cache is warm, no downloads
+#
+# Jobs 2 & 3 run in parallel. No race conditions because setup runs first.
+##############################################################################
+
+name: "Build Driver App (Android)"
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/delivery_app/**"
+      - "packages/**"
+      - ".github/workflows/build_driver_android.yml"
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: apps/delivery_app
+
+# ═════════════════════════════════════════════════════════════════════════════
+jobs:
+
+  # ── Step 1: Warm the cache (runs once) ────────────────────────────────────
+  setup_env:
+    name: Setup Environment
+    runs-on: k8s-runner
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xz-utils curl git unzip
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      # ── Flutter SDK ───────────────────────────────────────────────────
+      - name: Setup Flutter (cached)
+        run: |
+          FLUTTER_VERSION="3.41.4"
+          FLUTTER_DIR="/opt/cache/flutter"
+          if [ -x "$FLUTTER_DIR/bin/flutter" ]; then
+            echo "✅ Flutter found in cache"
+          else
+            echo "⬇️  Downloading Flutter $FLUTTER_VERSION..."
+            rm -rf "$FLUTTER_DIR"
+            git clone --depth 1 --branch "$FLUTTER_VERSION" https://github.com/flutter/flutter.git "$FLUTTER_DIR"
+          fi
+          echo "$FLUTTER_DIR/bin" >> $GITHUB_PATH
+          echo "$FLUTTER_DIR/bin/cache/dart-sdk/bin" >> $GITHUB_PATH
+
+      - name: Flutter precache
+        run: flutter precache --android
+        working-directory: .
+
+      # ── Android SDK ───────────────────────────────────────────────────
+      - name: Setup Android SDK (cached)
+        run: |
+          SDK_ROOT="/opt/cache/android-sdk"
+          CMDLINE="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$CMDLINE" ]; then
+            echo "⬇️  Downloading Android cmdline-tools..."
+            mkdir -p "$SDK_ROOT/cmdline-tools"
+            curl -sSL https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -o /tmp/cmdline.zip
+            unzip -qo /tmp/cmdline.zip -d "$SDK_ROOT/cmdline-tools"
+            mv "$SDK_ROOT/cmdline-tools/cmdline-tools" "$SDK_ROOT/cmdline-tools/latest"
+            rm /tmp/cmdline.zip
+          fi
+          yes | "$CMDLINE" --licenses > /dev/null 2>&1 || true
+          "$CMDLINE" --install "platform-tools" "platforms;android-34" "build-tools;34.0.0" > /dev/null 2>&1 || true
+          echo "✅ Android SDK ready"
+        working-directory: .
+
+      # ── Pub dependencies ──────────────────────────────────────────────
+      - name: Install dependencies (workspace)
+        run: flutter pub get
+        working-directory: .
+
+      - name: Install dependencies (delivery_app)
+        run: flutter pub get
+
+      - name: Setup complete
+        run: echo "✅ Cache is warm — Flutter, Android SDK, pub deps all ready"
+
+  # ── Step 2: Build APK (uses warm cache) ───────────────────────────────────
+  build_apk:
+    name: Build APK
+    needs: [setup_env]
+    runs-on: k8s-runner
+    env:
+      GRADLE_OPTS: >-
+        -Dorg.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=512m
+        -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8
+        -Dorg.gradle.daemon=true
+        -Dorg.gradle.parallel=true
+      JAVA_TOOL_OPTIONS: "-Dfile.encoding=UTF-8"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Configure cached tools
+        run: |
+          echo "/opt/cache/flutter/bin" >> $GITHUB_PATH
+          echo "/opt/cache/flutter/bin/cache/dart-sdk/bin" >> $GITHUB_PATH
+          echo "/opt/cache/android-sdk/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "/opt/cache/android-sdk/platform-tools" >> $GITHUB_PATH
+
+      - name: Install dependencies (workspace)
+        run: flutter pub get
+        working-directory: .
+
+      - name: Install dependencies (delivery_app)
+        run: flutter pub get
+
+      - name: Strip dev-only plugins from native registrant
+        run: |
+          REGISTRANT="android/app/src/main/java/io/flutter/plugins/GeneratedPluginRegistrant.java"
+          if [ -f "$REGISTRANT" ]; then
+            sed -i '/flutter_native_splash/d' "$REGISTRANT"
+          fi
+
+      - name: Extract version
+        id: version
+        run: |
+          VERSION=$(grep '^version:' pubspec.yaml | sed 's/version: //' | sed 's/+.*//')
+          echo "BUILD_NAME=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Decode Keystore
+        run: |
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 --decode > ${{ runner.temp }}/release.jks
+
+      - name: Build APK
+        run: flutter build apk --release --build-name=${{ steps.version.outputs.BUILD_NAME }} --build-number=${{ github.run_number }}
+        env:
+          KEYSTORE_PATH: ${{ runner.temp }}/release.jks
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+
+      - name: Send APK to Telegram
+        if: success()
+        run: |
+          curl -F chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+               -F document=@build/app/outputs/flutter-apk/app-release.apk \
+               -F caption="🚚 Grocery Driver v${{ steps.version.outputs.BUILD_NAME }} (Build #${{ github.run_number }})
+          Branch: ${{ github.ref_name }}
+          Commit: ${{ github.event.head_commit.message }}" \
+               https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendDocument
+
+  # ── Step 3: Build AAB & Publish (uses warm cache) ─────────────────────────
+  build_aab:
+    name: Build AAB & Publish
+    needs: [setup_env]
+    runs-on: k8s-runner
+    env:
+      GRADLE_OPTS: >-
+        -Dorg.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=512m
+        -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8
+        -Dorg.gradle.daemon=true
+        -Dorg.gradle.parallel=true
+      JAVA_TOOL_OPTIONS: "-Dfile.encoding=UTF-8"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Configure cached tools
+        run: |
+          echo "/opt/cache/flutter/bin" >> $GITHUB_PATH
+          echo "/opt/cache/flutter/bin/cache/dart-sdk/bin" >> $GITHUB_PATH
+          echo "/opt/cache/android-sdk/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "/opt/cache/android-sdk/platform-tools" >> $GITHUB_PATH
+
+      - name: Install dependencies (workspace)
+        run: flutter pub get
+        working-directory: .
+
+      - name: Install dependencies (delivery_app)
+        run: flutter pub get
+
+      - name: Strip dev-only plugins from native registrant
+        run: |
+          REGISTRANT="android/app/src/main/java/io/flutter/plugins/GeneratedPluginRegistrant.java"
+          if [ -f "$REGISTRANT" ]; then
+            sed -i '/flutter_native_splash/d' "$REGISTRANT"
+          fi
+
+      - name: Extract version
+        id: version
+        run: |
+          VERSION=$(grep '^version:' pubspec.yaml | sed 's/version: //' | sed 's/+.*//')
+          echo "BUILD_NAME=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Decode Keystore
+        run: |
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 --decode > ${{ runner.temp }}/release.jks
+
+      - name: Build App Bundle
+        run: flutter build appbundle --release --build-name=${{ steps.version.outputs.BUILD_NAME }} --build-number=${{ github.run_number }}
+        env:
+          KEYSTORE_PATH: ${{ runner.temp }}/release.jks
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+
+      - name: Publish to Play Store
+        if: success()
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.PLAYSTORE_SERVICE_ACCOUNT_JSON }}
+          packageName: com.rydo.grocery.delivery_app
+          releaseFiles: apps/delivery_app/build/app/outputs/bundle/release/app-release.aab
+          track: alpha

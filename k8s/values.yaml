@@ -1,0 +1,52 @@
+##############################################################################
+# Helm values for gha-runner-scale-set
+# Mounts /data/runner-cache into runner pods for persistent SDK caching
+##############################################################################
+
+## ── Container spec overrides ────────────────────────────────────────────────
+template:
+  spec:
+    initContainers:
+      - name: fix-cache-permissions
+        image: busybox:latest
+        command: ["sh", "-c"]
+        args:
+          - |
+            mkdir -p /opt/cache/flutter /opt/cache/pub-cache /opt/cache/gradle /opt/cache/android-sdk
+            chmod -R 777 /opt/cache
+        securityContext:
+          runAsUser: 0
+        volumeMounts:
+          - name: cache-vol
+            mountPath: /opt/cache
+    containers:
+      - name: runner
+        image: ghcr.io/actions/actions-runner:latest
+        command: ["/home/runner/run.sh"]
+        env:
+          ## SDK / tool cache paths — each action checks these first
+          - name: FLUTTER_ROOT
+            value: /opt/cache/flutter
+          - name: PUB_CACHE
+            value: /opt/cache/pub-cache
+          - name: GRADLE_USER_HOME
+            value: /opt/cache/gradle
+          - name: ANDROID_HOME
+            value: /opt/cache/android-sdk
+          - name: ANDROID_SDK_ROOT
+            value: /opt/cache/android-sdk
+        resources:
+          requests:
+            cpu: "2"
+            memory: 4Gi
+          limits:
+            cpu: "4"
+            memory: 6Gi
+        volumeMounts:
+          - name: cache-vol
+            mountPath: /opt/cache
+    volumes:
+      - name: cache-vol
+        persistentVolumeClaim:
+          claimName: runner-cache-pvc
+

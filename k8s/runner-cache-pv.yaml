@@ -1,0 +1,34 @@
+##############################################################################
+# PersistentVolume + PVC for runner dependency cache
+# Uses hostPath on external disk /data/runner-cache (sdb1, 1.1TB)
+##############################################################################
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: runner-cache-pv
+  labels:
+    usage: runner-cache
+spec:
+  capacity:
+    storage: 50Gi
+  accessModes:
+    - ReadWriteOnce        # Single-node K3s, all pods on same node
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: runner-cache
+  hostPath:
+    path: /data/runner-cache
+    type: DirectoryOrCreate
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: runner-cache-pvc
+  namespace: actions-runner-system
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: runner-cache
+  resources:
+    requests:
+      storage: 50Gi
