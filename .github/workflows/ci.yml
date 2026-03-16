@@ -8,7 +8,7 @@ on:
 
 jobs:
   build:
-    runs-on: k8s-runner   # ← This matches the runnerScaleSetName
+    runs-on: k8s-infra-runner   # ← Matches runnerScaleSetName for this repo
 
     steps:
       - name: Checkout code
