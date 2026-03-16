@@ -6,18 +6,22 @@ set -euo pipefail
 # Uses gh CLI for auth, ARC v2 (Runner Scale Sets) for auto-scaling
 ################################################################################
 
-REPO_URL="https://github.com/sonurust/grocery-project"
 NAMESPACE="actions-runner-system"
-RUNNER_NAME="k8s-runner"
 MIN_RUNNERS=0    # Scale to zero when idle
 MAX_RUNNERS=15   # Max concurrent runners
 
+# ─── Repositories to register runners for ────────────────────────────────────
+# Format: release-name|runner-label|repo-url
+REPOS=(
+  "grocery-runner|k8s-runner|https://github.com/sonurust/grocery-project"
+  "infra-runner|k8s-infra-runner|https://github.com/sonurust/kubnets-github-action-runner"
+)
+
 echo "🚀 GitHub Actions Self-Hosted Runner Setup"
 echo "==========================================="
-echo "Repo:        $REPO_URL"
 echo "Namespace:   $NAMESPACE"
-echo "Runner name: $RUNNER_NAME"
 echo "Scaling:     $MIN_RUNNERS → $MAX_RUNNERS"
+echo "Repos:       ${#REPOS[@]}"
 echo ""
 
 # ─── Prerequisite Checks ─────────────────────────────────────────────────────
@@ -117,19 +121,23 @@ else
   echo "✅ ARC controller installed"
 fi
 
-# ─── Deploy Runner Scale Set ─────────────────────────────────────────────────
+# ─── Deploy Runner Scale Sets ─────────────────────────────────────────────────
 
-echo "📦 Deploying runner scale set..."
-helm upgrade --install grocery-runner \
-  --namespace "$NAMESPACE" \
-  -f "$SCRIPT_DIR/k8s/values.yaml" \
-  --set githubConfigUrl="$REPO_URL" \
-  --set githubConfigSecret=github-token \
-  --set minRunners="$MIN_RUNNERS" \
-  --set maxRunners="$MAX_RUNNERS" \
-  --set runnerScaleSetName="$RUNNER_NAME" \
-  oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
-echo "✅ Runner scale set deployed"
+for ENTRY in "${REPOS[@]}"; do
+  IFS='|' read -r RELEASE_NAME RUNNER_LABEL REPO_URL <<< "$ENTRY"
+  echo ""
+  echo "📦 Deploying runner '$RUNNER_LABEL' for $REPO_URL..."
+  helm upgrade --install "$RELEASE_NAME" \
+    --namespace "$NAMESPACE" \
+    -f "$SCRIPT_DIR/k8s/values.yaml" \
+    --set githubConfigUrl="$REPO_URL" \
+    --set githubConfigSecret=github-token \
+    --set minRunners="$MIN_RUNNERS" \
+    --set maxRunners="$MAX_RUNNERS" \
+    --set runnerScaleSetName="$RUNNER_LABEL" \
+    oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
+  echo "✅ Runner '$RUNNER_LABEL' deployed for $REPO_URL"
+done
 
 # ─── Verify ──────────────────────────────────────────────────────────────────
 
@@ -142,16 +150,7 @@ echo ""
 echo "🎉 Setup Complete!"
 echo "==========================================="
 echo ""
-echo "Your self-hosted runner '$RUNNER_NAME' is now active."
-echo ""
-echo "Use it in your GitHub Actions workflows with:"
-echo ""
-echo "  jobs:"
-echo "    build:"
-echo "      runs-on: $RUNNER_NAME"
+echo "Runners active for ${#REPOS[@]} repos."
 echo ""
 echo "Auto-scaling: $MIN_RUNNERS (idle) → $MAX_RUNNERS (max concurrent)"
 echo "Runners are ephemeral — created per job, deleted after completion."
-echo ""
-echo "Check runner status at:"
-echo "  ${REPO_URL}/settings/actions/runners"
